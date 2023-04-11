@@ -12,6 +12,7 @@ from utils.utils import seed_everything
 from torch.utils.tensorboard import SummaryWriter
 from models.model import MyModel
 from models.ema import ExponentialMovingAverage
+from utils.utils import AverageMeter
 
 def train(config, workdir, train_dir='train'):
     """Runs the training pipeline.
@@ -143,7 +144,7 @@ def train(config, workdir, train_dir='train'):
         train_sampler.set_epoch(epoch)
         test_sampler.set_epoch(epoch)
         model.train()
-        train_loss_epoch = 0
+        train_loss_epoch = AverageMeter()
 
         if rank == 0:
             logger.info(f'Start training epoch {epoch + 1}.')
@@ -152,7 +153,7 @@ def train(config, workdir, train_dir='train'):
         # initialize data prefetcher
         # ----------------------------
 
-        train_prefetcher = prefetcher(train_loader, rank, mode='train')
+        train_prefetcher = prefetcher(train_loader, rank)
         x, y = train_prefetcher.next()
         i = 0
 
@@ -165,14 +166,14 @@ def train(config, workdir, train_dir='train'):
                 out = model(x)
                 loss = criterion(out, y)
 
-            train_loss_epoch += loss.item()
+            train_loss_epoch.update(loss.item(), x.shape[0])
 
             if rank == 0:
-                writer.add_scalar("Loss", loss.item(),
+                writer.add_scalar("Loss", train_loss_epoch.val,
                                   epoch * iters_per_epoch + i)
 
             logger.info(
-                f'Epoch: {epoch + 1}/{config.training.num_epochs}, Iter: {i + 1}/{iters_per_epoch}, Loss: {loss.item():.6f}, Time: {time_logger.time_length()}, Device: {rank}')
+                f'Epoch: {epoch + 1}/{config.training.num_epochs}, Iter: {i + 1}/{iters_per_epoch}, Loss: {train_loss_epoch.val:.6f}, Device: {rank}')
 
             optimizer.zero_grad()
             scaler.scale(loss).backward()
@@ -193,11 +194,10 @@ def train(config, workdir, train_dir='train'):
 
         scheduler.step()
 
-        avg_train_loss_epoch = train_loss_epoch / iters_per_epoch
         dist.barrier()
         if rank == 0:
             logger.info(
-                f'Epoch: {epoch + 1}/{config.training.num_epochs}, Avg loss: {avg_train_loss_epoch}, Time: {time_logger.time_length()}')
+                f'Epoch: {epoch + 1}/{config.training.num_epochs}, Avg loss: {train_loss_epoch.avg:.4f}, Time: {time_logger.time_length()}')
 
         # save snapshot periodically
 
@@ -214,11 +214,11 @@ def train(config, workdir, train_dir='train'):
                 if config.model.ema:
                     snapshot['model_ema'] = model_ema.state_dict()
                 torch.save(snapshot, os.path.join(
-                    ckpt_dir, f'{epoch+1}_loss_{avg_train_loss_epoch:.2f}.pth'))
+                    ckpt_dir, f'{epoch+1}_loss_{train_loss_epoch.avg:.2f}.pth'))
 
-        is_best = avg_train_loss_epoch < best_loss
+        is_best = train_loss_epoch.avg < best_loss
         if is_best:
-            best_loss = avg_train_loss_epoch
+            best_loss = train_loss_epoch.avg
             if rank == 0:
                 logger.info(
                     f'Saving best model state dict at epoch {epoch + 1}.')
@@ -236,7 +236,7 @@ def train(config, workdir, train_dir='train'):
             with torch.inference_mode():
                 eval_model.eval()
                 iters_per_eval = len(test_loader)
-                loss_sum = 0
+                eval_loss_epoch = AverageMeter()
 
                 # ----------------------------
                 # initialize data prefetcher
@@ -251,26 +251,25 @@ def train(config, workdir, train_dir='train'):
                         out = model(x)
                         loss = criterion(out, y)
 
-                    loss_sum += loss.item()
+                    eval_loss_epoch.update(loss.item(), x.shape[0])
                     logger.info(
-                        f'Epoch: {epoch + 1}/{config.training.num_epochs}, Iter: {i + 1}/{iters_per_eval}, Loss: {loss.item():.6f}, Time: {time_logger.time_length()}, Device: {rank}')
+                        f'Epoch: {epoch + 1}/{config.training.num_epochs}, Iter: {i + 1}/{iters_per_eval}, Loss: {eval_loss_epoch.val:.6f}, Time: {time_logger.time_length()}, Device: {rank}')
 
                     x, y = test_prefetcher.next()
                     i += 1
 
-                avg_eval_loss_epoch = loss_sum / iters_per_eval
                 if rank == 0:
-                    writer.add_scalar('Eval loss', avg_eval_loss_epoch, epoch)
+                    writer.add_scalar('Eval loss', eval_loss_epoch.avg, epoch)
 
             if rank == 0:
                 logger.info(
-                    f'Epoch: {epoch + 1}/{config.training.num_epochs}, Avg eval loss: {avg_eval_loss_epoch}, Time: {time_logger.time_length()}')
+                    f'Epoch: {epoch + 1}/{config.training.num_epochs}, Avg eval loss: {eval_loss_epoch.avg:.4f}, Time: {time_logger.time_length()}')
 
         dist.barrier()
 
     if rank == 0:
         logger.info(
-            f'Training complete.\nTotal time:, {time_logger.time_length()}\nFinal loss:, {avg_train_loss_epoch}\nBest loss:, {best_loss}\nFinal eval loss:, {avg_eval_loss_epoch}')
+            f'Training complete.\nTotal time:, {time_logger.time_length()}')
 
 
 def eval(config, workdir, eval_dir='eval'):
